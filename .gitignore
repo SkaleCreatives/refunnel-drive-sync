@@ -1,0 +1,8 @@
+export.csv
+pending.tsv
+shard.tsv
+failed.txt
+errors.log
+files.json
+node_modules/
+.DS_Store

@@ -1,0 +1,109 @@
+# Refunnel export -> Google Drive + Google Sheet. Actions -> Refunnel sync -> Run workflow. Setup: README.md
+name: Refunnel sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder:
+        description: "Google Drive folder (URL or ID). Empty = repository variable DRIVE_FOLDER"
+        required: false
+      sheet:
+        description: "Existing Google Sheet to extend (URL or ID). Empty = 'Refunnel Content' in the folder, created if missing"
+        required: false
+      limit:
+        description: "Upload only the first n files (for a test). Empty = all"
+        required: false
+
+concurrency:
+  group: refunnel-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SHARDS: 4
+  GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+  GOOGLE_SUBJECT: ${{ secrets.GOOGLE_SUBJECT }}
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      folder: ${{ steps.resolve.outputs.FOLDER_ID }}
+      drive: ${{ steps.resolve.outputs.DRIVE_ID }}
+      sheet: ${{ steps.resolve.outputs.SHEET_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find folder, sheet and newest export
+        id: resolve
+        env:
+          FOLDER: ${{ inputs.folder || vars.DRIVE_FOLDER }}
+          SHEET: ${{ inputs.sheet || vars.SHEET }}
+        run: node sync.mjs resolve | tee -a "$GITHUB_OUTPUT" >> "$GITHUB_ENV"
+      - name: Import the export into the sheet
+        run: |
+          if [ -f export.csv ]; then node sync.mjs import export.csv | tee -a "$GITHUB_STEP_SUMMARY"
+          else echo "No CSV in _exports - nothing to import" | tee -a "$GITHUB_STEP_SUMMARY"; fi
+      - name: Files without Drive link
+        run: node sync.mjs pending ${{ inputs.limit }} > pending.tsv
+      - name: Month folders (before the parallel upload, so no folder is created twice)
+        run: |
+          sudo apt-get install -y -qq rclone > /dev/null
+          node sync.mjs rclone-env >> "$GITHUB_ENV"
+      - run: cut -f1 pending.tsv | sort -u | xargs -r -I{} rclone mkdir "drive:{}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pending
+          path: pending.tsv
+
+  upload:
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      FOLDER_ID: ${{ needs.prep.outputs.folder }}
+      DRIVE_ID: ${{ needs.prep.outputs.drive }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get install -y -qq rclone > /dev/null
+          node sync.mjs rclone-env >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: pending
+      - name: Upload shard ${{ matrix.shard }}
+        run: ./upload.sh ${{ matrix.shard }} "$SHARDS" < pending.tsv
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-${{ matrix.shard }}
+          path: |
+            failed.txt
+            errors.log
+          if-no-files-found: ignore
+
+  links:
+    needs: [prep, upload]
+    if: "!cancelled() && needs.prep.result == 'success'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FOLDER_ID: ${{ needs.prep.outputs.folder }}
+      DRIVE_ID: ${{ needs.prep.outputs.drive }}
+      SHEET_ID: ${{ needs.prep.outputs.sheet }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get install -y -qq rclone > /dev/null
+          node sync.mjs rclone-env >> "$GITHUB_ENV"
+      - name: Drive links into the sheet
+        run: |
+          rclone lsjson -R --files-only --exclude "_exports/**" drive: > files.json
+          node sync.mjs links files.json | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Sheet: https://docs.google.com/spreadsheets/d/$SHEET_ID" >> "$GITHUB_STEP_SUMMARY"
