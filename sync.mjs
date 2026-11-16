@@ -1,24 +1,19 @@
 #!/usr/bin/env node
 // refunnel-drive-sync: a Refunnel export (CSV) -> Google Drive (one folder per month) + a Google Sheet with a clickable
-// Drive link per file. No dependencies (Node 20+). Run by .github/workflows/sync.yml; see README.md.
+// Drive link per file. No dependencies (Node 18+). Started by start.sh, which also does the Google sign-in; see README.md.
 //
-// Environment
-//   GOOGLE_SERVICE_ACCOUNT  service account key (JSON, or the JSON base64-encoded)
-//   GOOGLE_SUBJECT          optional: Google Workspace user the service account acts as (domain-wide delegation)
-//   FOLDER                  Drive folder (URL or ID): files go into <FOLDER>/<YYYY-MM>/, exports are read from <FOLDER>/_exports
-//   SHEET                   optional: existing Google Sheet to extend (URL or ID); default: "Refunnel Content" in FOLDER
+// Google access is the user's own sign-in, kept by rclone in rclone.conf (remote "gdrive"); rclone refreshes it.
+// Environment: RCLONE (path of rclone), RCLONE_CONFIG (rclone.conf), FOLDER (Drive folder URL or ID),
+//              SHEET (optional: existing Google Sheet URL or ID; default "Refunnel Content" in FOLDER)
 //
 // Commands
-//   resolve              prints FOLDER_ID, DRIVE_ID, SHEET_ID, EXPORT (KEY=value); creates the sheet if there is none and
-//                        downloads the newest CSV in <FOLDER>/_exports to export.csv
+//   resolve              prints FOLDER_ID, DRIVE_ID, SHEET_ID (KEY=value); creates the sheet if there is none
 //   import <csv>         known files (by Media URL) get fresh values, new files become rows; Launch Status, Drive Link
 //                        and any column of your own stay; rows sorted newest first
 //   pending [limit]      rows without Drive Link -> stdout "month<TAB>file name<TAB>url"
 //   links <files.json>   `rclone lsjson -R` of the folder -> fills Drive Link
-//   rclone-env           writes the key to $RUNNER_TEMP and prints the rclone remote "drive" (RCLONE_CONFIG_DRIVE_*)
-import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import path from "node:path";
 
 const GAPI = "https://www.googleapis.com";
 const SHEETS = "https://sheets.googleapis.com/v4/spreadsheets";
@@ -51,27 +46,20 @@ const rgb = (h) => ({ red: parseInt(h.slice(1, 3), 16) / 255, green: parseInt(h.
 const q = (s) => `'${String(s).replace(/'/g, "\\'")}'`;
 
 // ---------- Google access ----------
-function key() {
-  const raw = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
-  if (!raw) throw new Error("GOOGLE_SERVICE_ACCOUNT is not set");
-  return JSON.parse(raw.startsWith("{") ? raw : Buffer.from(raw, "base64").toString("utf8"));
+// The token rclone got at sign-in; when it is close to expiry, a small rclone call refreshes it (rclone saves the new one).
+function rcloneToken() {
+  const conf = JSON.parse(execFileSync(process.env.RCLONE || "rclone", ["config", "dump"], { encoding: "utf8" }));
+  if (!conf.gdrive?.token) throw new Error("not signed in to Google - run ./start.sh");
+  return JSON.parse(conf.gdrive.token);
 }
-
-let cached;
 async function token() {
-  if (cached && cached.until > Date.now()) return cached.token;
-  const sa = key();
-  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
-  const now = Math.floor(Date.now() / 1000);
-  const claim = { iss: sa.client_email, scope: `${GAPI}/auth/drive`, aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600 };
-  if (process.env.GOOGLE_SUBJECT) claim.sub = process.env.GOOGLE_SUBJECT;
-  const unsigned = `${b64({ alg: "RS256", typ: "JWT" })}.${b64(claim)}`;
-  const jwt = `${unsigned}.${crypto.sign("RSA-SHA256", Buffer.from(unsigned), sa.private_key).toString("base64url")}`;
-  const res = await fetch("https://oauth2.googleapis.com/token", { method: "POST",
-    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: jwt }) });
-  if (!res.ok) throw new Error(`Google login failed: ${res.status} ${await res.text()}`);
-  cached = { token: (await res.json()).access_token, until: Date.now() + 50 * 60 * 1000 };
-  return cached.token;
+  let t = rcloneToken();
+  if (Date.parse(t.expiry) - Date.now() < 5 * 60 * 1000) {
+    execFileSync(process.env.RCLONE || "rclone", ["lsjson", "gdrive:", "--max-depth", "1", "--dirs-only"], { stdio: "ignore",
+      env: { ...process.env, RCLONE_DRIVE_ROOT_FOLDER_ID: "", RCLONE_DRIVE_TEAM_DRIVE: "" } });
+    t = rcloneToken();
+  }
+  return t.access_token;
 }
 
 async function api(url, init = {}, raw = false) {
@@ -203,7 +191,7 @@ async function info(sheetId, folderId) {
     ["", "Colour scale", "GMV, Impressions, Likes, Comments, Shares: white = 0, green = top performers (75th to 99th percentile)"],
     ["", "Hidden columns", "Platform, Post Link, Followers, Hashtags and more: right-click a column header › Show columns"],
     ["", "Drive folders", "One folder per month of the post date. File name: date_platform_creator_id"],
-    ["", "New content", "Put a new Refunnel export (CSV) into the folder _exports and run the sync again"],
+    ["", "New content", "Export again from Refunnel and run ./start.sh with the new CSV"],
   ];
   await api(values(sheetId, "Info!A1", "?valueInputOption=USER_ENTERED"), { method: "PUT", body: JSON.stringify({ values: rows.map(([, a, b]) => ["", a, b]) }) });
   const r = (a, b, c0 = 0, c1 = 3) => ({ sheetId: sid, startRowIndex: a, endRowIndex: b, startColumnIndex: c0, endColumnIndex: c1 });
@@ -256,8 +244,9 @@ function value(k, v) {
 
 function fileName(rec) {
   const [, stem, ext] = rec.media_url.match(/\/([^/?]+)\.(\w+)(?:\?.*)?$/) || [, rec.id, "mp4"];
-  const user = (rec.username || "").replace(/[^A-Za-z0-9._-]/g, "") || "unknown";
-  return `${rec.created_at.slice(0, 10)}_${(rec.platform || "").toLowerCase()}_${user}_${stem}.${ext}`;
+  const clean = (s) => String(s || "").replace(/[^A-Za-z0-9._-]/g, "");
+  const user = clean(rec.username) || "unknown";
+  return `${clean(rec.created_at.slice(0, 10))}_${clean(rec.platform).toLowerCase()}_${user}_${clean(stem)}.${clean(ext)}`;
 }
 
 async function importCsv(sheetId, file) {
@@ -299,34 +288,21 @@ async function importCsv(sheetId, file) {
 }
 
 // ---------- commands ----------
-const out = (k, v) => console.log(`${k}=${v}`);
+// start.sh evals these lines: only ids made of letters, digits, - and _ get through
+const out = (k, v) => { if (!/^[-\w]*$/.test(v)) throw new Error(`${k}: unexpected value`); console.log(`${k}=${v}`); };
 const [cmd, arg] = process.argv.slice(2);
 const href = (v) => String(v || "").match(/https:\/\/drive\.google\.com\/[^"\s]+/)?.[0] || "";
 
-if (cmd === "rclone-env") {
-  const file = path.join(process.env.RUNNER_TEMP || ".", "google-key.json");
-  fs.writeFileSync(file, JSON.stringify(key()), { mode: 0o600 });
-  out("RCLONE_CONFIG_DRIVE_TYPE", "drive"); out("RCLONE_CONFIG_DRIVE_SCOPE", "drive");
-  out("RCLONE_CONFIG_DRIVE_SERVICE_ACCOUNT_FILE", file);
-  out("RCLONE_CONFIG_DRIVE_ROOT_FOLDER_ID", process.env.FOLDER_ID);
-  if (process.env.DRIVE_ID) out("RCLONE_CONFIG_DRIVE_TEAM_DRIVE", process.env.DRIVE_ID);
-  if (process.env.GOOGLE_SUBJECT) out("RCLONE_CONFIG_DRIVE_IMPERSONATE", process.env.GOOGLE_SUBJECT);
-} else if (cmd === "resolve") {
+if (cmd === "resolve") {
   const folderId = id(process.env.FOLDER);
   if (!folderId) throw new Error("FOLDER is not set (Drive folder URL or ID)");
   const folder = await drive(`files/${folderId}`, { fields: "id,name,driveId,mimeType,capabilities(canAddChildren)" });
   if (folder.mimeType !== "application/vnd.google-apps.folder") throw new Error(`${folder.name} is not a folder`);
-  if (!folder.capabilities.canAddChildren) throw new Error(`no write access to the folder "${folder.name}" - share it with the service account (Contributor or Editor)`);
+  if (!folder.capabilities.canAddChildren) throw new Error(`no write access to the folder "${folder.name}" with this Google account`);
   let sheetId = id(process.env.SHEET);
   if (!sheetId) sheetId = (await children(folderId, `name = ${q(TITLE)} and mimeType = 'application/vnd.google-apps.spreadsheet'`))[0]?.id;
   if (!sheetId) { sheetId = await createSheet(folderId); console.error(`created the sheet "${TITLE}"`); }
-  const exports = (await children(folderId, `name = '_exports' and mimeType = 'application/vnd.google-apps.folder'`))[0];
-  const csv = exports && (await children(exports.id, "mimeType != 'application/vnd.google-apps.folder'")).find((f) => /\.csv$/i.test(f.name));
-  if (csv) {
-    const res = await api(`${GAPI}/drive/v3/files/${csv.id}?alt=media&supportsAllDrives=true`, {}, true);
-    fs.writeFileSync("export.csv", Buffer.from(await res.arrayBuffer()));
-  }
-  out("FOLDER_ID", folderId); out("DRIVE_ID", folder.driveId || ""); out("SHEET_ID", sheetId); out("EXPORT", csv?.name || "");
+  out("FOLDER_ID", folderId); out("DRIVE_ID", folder.driveId || ""); out("SHEET_ID", sheetId);
 } else if (cmd === "import") {
   console.log(await importCsv(id(process.env.SHEET_ID), arg));
 } else if (cmd === "pending" || cmd === "links") {
@@ -347,6 +323,6 @@ if (cmd === "rclone-env") {
     console.log(`${rows.length} rows, ${colValues.filter((c) => c[0]).length} with Drive link, ${colValues.filter((c) => !c[0]).length} without`);
   }
 } else {
-  console.error("usage: node sync.mjs resolve | import <csv> | pending [limit] | links <files.json> | rclone-env");
+  console.error("usage: node sync.mjs resolve | import <csv> | pending [limit] | links <files.json>  (normally via ./start.sh)");
   process.exit(1);
 }
