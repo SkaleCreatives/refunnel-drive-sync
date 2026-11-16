@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
-# Streams the files of one shard from Refunnel's CDN straight into Drive (rclone copyurl, nothing is stored on disk).
-#   upload.sh <shard> <shards> < pending.tsv      lines "month<TAB>file name<TAB>url" from `node sync.mjs pending`
-# Files already in Drive are skipped, so a re-run only uploads what is missing. Failed names -> failed.txt.
+# Copies each file from Refunnel's CDN into your Drive (rclone copyurl, 8 at a time, nothing is stored on your computer).
+#   upload.sh < pending.tsv      lines "month<TAB>file name<TAB>url" from `node sync.mjs pending`
+# Files already in Drive are skipped, so a re-run only copies what is missing. Failed files -> failed.txt.
 set -euo pipefail
-shard=$1 shards=$2
-awk -F'\t' -v s="$shard" -v k="$shards" '(NR - 1) % k == s' > shard.tsv
-echo "shard $shard/$shards: $(wc -l < shard.tsv | tr -d ' ') files"
-: > failed.txt
+cat > upload.tsv
+total=$(wc -l < upload.tsv | tr -d ' ')
+[ "$total" -gt 0 ] || { echo "Nothing to copy, everything is in Drive."; rm -f upload.tsv; exit 0; }
+echo "Copying $total files into Drive. Big libraries take hours - you can stop any time and run ./start.sh again later."
+: > done.txt; : > failed.txt
 one() {
   IFS=$'\t' read -r month name url <<< "$1"
-  case "$url" in https://cdn.refunnel.com/*) ;; *) echo "$name (not a Refunnel URL)" >> failed.txt; return ;; esac
-  rclone copyurl --no-clobber --retries 3 --low-level-retries 10 "$url" "drive:$month/$name" 2>> errors.log || echo "$name" >> failed.txt
+  case "$url" in https://cdn.refunnel.com/*) ;; *) echo "$name (not a Refunnel link)" >> failed.txt; return ;; esac
+  # month and name come from the sheet: only a plain YYYY-MM folder and a plain file name, nothing outside the folder
+  [[ "$month" =~ ^[0-9]{4}-[0-9]{2}$ && "$name" =~ ^[A-Za-z0-9._-]+$ && "$name" != .* ]] || { echo "$name (unsafe name)" >> failed.txt; return; }
+  if "$RCLONE" copyurl --no-clobber --retries 3 --low-level-retries 10 "$url" "gdrive:$month/$name" 2>> errors.log
+  then echo "$name" >> done.txt; else echo "$name" >> failed.txt; fi
 }
 export -f one
-tr '\n' '\0' < shard.tsv | xargs -0 -r -P 8 -I{} bash -c 'one "$1"' _ {}
-echo "shard $shard: $(wc -l < failed.txt | tr -d ' ') failed"
+( while sleep 30; do echo "  $(wc -l < done.txt | tr -d ' ') / $total copied"; done ) & progress=$!
+trap 'kill $progress 2> /dev/null' EXIT
+tr '\n' '\0' < upload.tsv | xargs -0 -P 8 -I{} bash -c 'one "$1"' _ {}
+echo "Copied $(wc -l < done.txt | tr -d ' ') of $total. Failed: $(wc -l < failed.txt | tr -d ' ') (see failed.txt - usually files Refunnel no longer has)."
+rm -f upload.tsv done.txt

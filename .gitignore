@@ -1,8 +1,10 @@
 export.csv
 pending.tsv
-shard.tsv
+upload.tsv
+done.txt
 failed.txt
 errors.log
 files.json
-node_modules/
+rclone.conf
+bin/
 .DS_Store
